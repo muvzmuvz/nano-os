@@ -1,0 +1,1620 @@
+Я делаю свою операционную систему вот код
+
+grub.cfg
+
+
+
+set timeout=0
+set default=0
+
+menuentry "nano-os" {
+    multiboot /boot/kernel.elf
+    boot
+}
+
+
+linker.ld
+
+ENTRY(multiboot_entry)
+SECTIONS
+{
+  . = 1M;
+  .multiboot : { *(.multiboot) }
+  .text : { *(.text*) }
+  .rodata : { *(.rodata*) }
+  .data : { *(.data*) }
+  .bss  : { *(.bss*) *(COMMON) }
+}
+
+
+Makefile
+ISO_DIR=iso
+TARGET=kernel.elf
+
+CC=gcc
+LD=ld
+AS=nasm
+
+CFLAGS=-m32 -ffreestanding -O2 -Wall -Wextra -fno-builtin -fno-stack-protector -nostdlib -fno-pic -I. -Ikernel
+LDFLAGS=-melf_i386 -T linker.ld
+ASFLAGS=-felf32
+
+# Источники
+C_SOURCES := $(wildcard kernel/*.c fs/*.c user/*.c)
+ASM_SOURCES := $(wildcard kernel/*.asm)
+S_SOURCES := $(wildcard boot/*.s)
+
+# Объекты — ТОЛЬКО .o
+OBJS := $(C_SOURCES:.c=.o) $(ASM_SOURCES:.asm=.o) $(S_SOURCES:.s=.o)
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS) linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+
+# Правила компиляции
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+%.o: %.asm
+	$(AS) $(ASFLAGS) $< -o $@
+
+%.o: %.s
+	$(AS) $(ASFLAGS) $< -o $@
+
+iso: $(TARGET) grub.cfg
+	rm -rf $(ISO_DIR)
+	mkdir -p $(ISO_DIR)/boot/grub
+	cp $(TARGET) $(ISO_DIR)/boot/kernel.elf
+	cp grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	grub-mkrescue -o $(ISO_DIR)/nano-os.iso $(ISO_DIR)
+
+run: iso
+	qemu-system-x86_64 -m 256 -cdrom $(ISO_DIR)/nano-os.iso -no-reboot -no-shutdown
+
+clean:
+	rm -f $(TARGET) $(OBJS)
+	rm -rf $(ISO_DIR)
+
+
+/boot/muiltiboot.s
+[bits 32]
+section .multiboot
+align 4
+%define MULTIBOOT_MAGIC 0x1BADB002
+%define MULTIBOOT_FLAGS 0x00000003 ; align + mem info
+%define MULTIBOOT_CHECK (-(MULTIBOOT_MAGIC + MULTIBOOT_FLAGS))
+
+dd MULTIBOOT_MAGIC
+dd MULTIBOOT_FLAGS
+dd MULTIBOOT_CHECK
+
+section .text
+global multiboot_entry
+extern kmain
+
+multiboot_entry:
+    cli
+    mov esp, stack_top
+    push eax        ; multiboot magic
+    push ebx        ; multiboot info ptr
+    call kmain
+.hang: hlt
+      jmp .hang
+
+section .bss
+align 16
+stack_bottom: resb 16384
+stack_top:
+fs/
+
+initramfs.c
+__attribute__((section(".rodata")))
+const char file_hello_txt[] =
+"hello from ramfs!\n"
+"you can 'cat /hello.txt'\n";
+
+__attribute__((section(".rodata")))
+const char file_info_txt[] =
+"nano-os demo files\n"
+"/hello.txt\n"
+"/info.txt\n";
+
+initramfs.inc
+__attribute__((section(".rodata")))
+const char file_hello_txt[] =
+"hello from ramfs!\n"
+"you can 'cat /hello.txt'\n";
+
+__attribute__((section(".rodata")))
+const char file_info_txt[] =
+"nano-os demo files\n"
+"/hello.txt\n"
+"/info.txt\n";
+
+ramfs.c
+// fs/ramfs.c
+#include <stdint.h>
+#include <stddef.h>
+#include "util.h"
+#include "tty.h"
+
+/* Простая плоская FS: до 64 файлов, имена до 31 симв., буфер под данные аллоцируется. */
+#define RAMFS_MAX_FILES 64
+
+typedef struct {
+    char     name[32];
+    char*    data;
+    size_t   len;
+    size_t   cap;
+    int      used;
+} node_t;
+
+static node_t fs[RAMFS_MAX_FILES];
+static size_t total_cap = 256*1024; /* для статистики: «воображаемый диск» 256КБ */
+extern void* kmalloc(size_t);       /* из kernel/heap.c */
+
+static node_t* find(const char* path){
+    if(!path || !*path) return 0;
+    /* допускаем "name" и "/name" */
+    const char* p = (*path=='/')? path+1 : path;
+    for(int i=0;i<RAMFS_MAX_FILES;i++)
+        if(fs[i].used && strcmp(fs[i].name,p)==0) return &fs[i];
+    return 0;
+}
+static node_t* create(const char* path){
+    const char* p = (*path=='/')? path+1 : path;
+    for(int i=0;i<RAMFS_MAX_FILES;i++) if(!fs[i].used){
+        memset(fs[i].name,0,32);
+        for(int j=0;j<31 && p[j]; j++) fs[i].name[j]=p[j];
+        fs[i].data=0; fs[i].len=0; fs[i].cap=0; fs[i].used=1;
+        return &fs[i];
+    }
+    return 0;
+}
+
+void ramfs_init(void){
+    memset(fs,0,sizeof(fs));
+    /* два стартовых файла */
+    const char* h =
+        "hello from ramfs!\n"
+        "you can 'type hello.txt'\n";
+    const char* i =
+        "nano-os demo files\n"
+        "hello.txt\n"
+        "info.txt\n";
+    ramfs_write("hello.txt", h, strlen(h), 0);
+    ramfs_write("info.txt",  i, strlen(i), 0);
+}
+
+const char* ramfs_read(const char* path){
+    node_t* n = find(path);
+    return n? n->data : 0;
+}
+
+int ramfs_write(const char* path, const char* s, size_t len, int append){
+    node_t* n = find(path);
+    if(!n){ n = create(path); if(!n) return -1; }
+
+    size_t need = append? (n->len + len) : len;
+    if(need > n->cap){
+        size_t newcap = (need + 255) & ~255u; /* кратно 256 */
+        char* nd = (char*)kmalloc(newcap);
+        if(!nd) return -2;
+        if(append && n->data && n->len) memcpy(nd, n->data, n->len);
+        n->data = nd; n->cap = newcap;
+    }
+    if(append){
+        memcpy(n->data + n->len, s, len);
+        n->len += len;
+    } else {
+        memcpy(n->data, s, len);
+        n->len = len;
+    }
+    return 0;
+}
+
+int ramfs_delete(const char* path){
+    node_t* n = find(path);
+    if(!n) return -1;
+    n->used=0; n->data=0; n->len=0; n->cap=0; n->name[0]=0;
+    return 0;
+}
+
+int ramfs_rename(const char* oldp, const char* newp){
+    node_t* n = find(oldp);
+    if(!n) return -1;
+    const char* p = (*newp=='/')? newp+1 : newp;
+    memset(n->name,0,32);
+    for(int j=0;j<31 && p[j]; j++) n->name[j]=p[j];
+    return 0;
+}
+
+void ramfs_ls(void){
+    for(int i=0;i<RAMFS_MAX_FILES;i++)
+        if(fs[i].used){ vga_puts(fs[i].name); vga_puts("\n"); }
+}
+
+void ramfs_stat(size_t* total,size_t* used,int* files){
+    size_t u=0; int f=0;
+    for(int i=0;i<RAMFS_MAX_FILES;i++)
+        if(fs[i].used){ u += fs[i].cap; f++; }
+    if(total) *total = total_cap;
+    if(used)  *used  = u;
+    if(files) *files = f;
+}
+
+vfs.c
+
+// fs/vfs.c
+#include "vfs.h"
+
+/* реализация на RAMFS */
+void       ramfs_init(void);
+const char* ramfs_read(const char* path);
+int        ramfs_write(const char* path, const char* s, size_t len, int append);
+int        ramfs_delete(const char* path);
+int        ramfs_rename(const char* oldp, const char* newp);
+void       ramfs_ls(void);
+void       ramfs_stat(size_t* total, size_t* used, int* files);
+
+void vfs_init(void){ ramfs_init(); }
+const char* vfs_read(const char* p){ return ramfs_read(p); }
+int  vfs_write(const char* p,const char* s,size_t n,int a){ return ramfs_write(p,s,n,a); }
+int  vfs_delete(const char* p){ return ramfs_delete(p); }
+int  vfs_rename(const char* a,const char* b){ return ramfs_rename(a,b); }
+void vfs_ls(void){ ramfs_ls(); }
+void vfs_stat(size_t* t,size_t* u,int* f){ ramfs_stat(t,u,f); }
+
+
+vfs.h
+
+// fs/vfs.h
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+
+void       vfs_init(void);
+
+/* базовые операции */
+const char* vfs_read(const char* path);                        // nullptr если нет
+int        vfs_write(const char* path, const char* s, size_t len, int append); // 0=ok
+int        vfs_delete(const char* path);                       // 0=ok
+int        vfs_rename(const char* oldp, const char* newp);     // 0=ok
+
+/* служебное */
+void       vfs_ls(void);
+void       vfs_stat(size_t* total, size_t* used, int* files);
+
+
+kernel/
+context_switch.asm
+[bits 32]
+section .text
+global ctx_switch
+; void ctx_switch(ctx_t* old, ctx_t* new)
+; ctx_t: struct { uint32_t esp, ebp, ebx, esi, edi, eip; }
+ctx_switch:
+    ; save old
+    mov eax, [esp+4]
+    mov [eax+0], esp
+    mov [eax+4], ebp
+    mov [eax+8], ebx
+    mov [eax+12], esi
+    mov [eax+16], edi
+    call .get_eip
+.get_eip:
+    pop edx
+    mov [eax+20], edx
+
+    ; load new
+    mov eax, [esp+8]
+    mov esp, [eax+0]
+    mov ebp, [eax+4]
+    mov ebx, [eax+8]
+    mov esi, [eax+12]
+    mov edi, [eax+16]
+    jmp dword [eax+20]
+
+gdt_idt.asm
+[bits 32]
+section .text
+global gdt_load, idt_load
+extern gdt_ptr, idt_ptr
+
+gdt_load:
+    lgdt [gdt_ptr]
+    ret
+
+idt_load:
+    lidt [idt_ptr]
+    ret
+
+gdt_reload.asm
+; kernel/gdt_reload.asm
+[bits 32]
+section .text
+global gdt_reload
+
+; После lgdt нужно обновить CS (через far jmp) и остальные сегменты.
+gdt_reload:
+    cli
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    ; дальний прыжок меняет CS на 0x08
+    jmp 0x08:flush_label
+
+flush_label:
+    sti
+    ret
+
+gdt.c
+// kernel/gdt.c
+#include <stdint.h>
+#include <stddef.h>
+
+struct gdt_entry {
+    uint16_t limit_low;
+    uint16_t base_low;
+    uint8_t  base_mid;
+    uint8_t  access;
+    uint8_t  gran;
+    uint8_t  base_hi;
+} __attribute__((packed));
+
+struct gdt_ptr_t {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed));
+
+static struct gdt_entry gdt[3];
+struct gdt_ptr_t gdt_ptr;        // нужен lgdt (extern в ASM)
+
+extern void gdt_load(void);      // из kernel/gdt_idt.asm
+extern void gdt_reload(void);    // новый ASM: перезагрузка CS/DS/ES/FS/GS/SS
+
+static void gdt_set(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t gran)
+{
+    gdt[i].limit_low = (uint16_t)(limit & 0xFFFF);
+    gdt[i].base_low  = (uint16_t)(base & 0xFFFF);
+    gdt[i].base_mid  = (uint8_t)((base >> 16) & 0xFF);
+    gdt[i].access    = access;
+    gdt[i].gran      = (uint8_t)(((limit >> 16) & 0x0F) | (gran & 0xF0));
+    gdt[i].base_hi   = (uint8_t)((base >> 24) & 0xFF);
+}
+
+void gdt_init(void)
+{
+    // null
+    gdt_set(0, 0, 0, 0, 0);
+    // code 0x08: base=0, limit=4ГБ, 32-бит, гранулярность 4К
+    gdt_set(1, 0, 0x000FFFFF, 0x9A, 0xCF);
+    // data 0x10: RW
+    gdt_set(2, 0, 0x000FFFFF, 0x92, 0xCF);
+
+    gdt_ptr.limit = sizeof(gdt) - 1;
+    gdt_ptr.base  = (uint32_t)gdt;
+
+    gdt_load();    // lgdt [gdt_ptr]
+    gdt_reload();  // ДАЛЬНИЙ ПРЫЖОК на CS=0x08 и DS/ES/FS/GS/SS=0x10
+}
+
+heap.c
+// kernel/heap.c
+#include <stdint.h>
+#include <stddef.h>
+#include "util.h"
+
+/* Куча в замапленном диапазоне (paging: 0..16MiB)
+   Возьмём 4MiB с 0x00400000 по 0x007FFFFF. */
+#define HEAP_BASE 0x00400000u
+#define HEAP_SIZE 0x00400000u
+
+static uint8_t* brk  = (uint8_t*)HEAP_BASE;
+static uint8_t* endh = (uint8_t*)(HEAP_BASE + HEAP_SIZE);
+
+static inline uint32_t align4k(uint32_t x){ return (x + 0xFFFu) & ~0xFFFu; }
+
+void* kmalloc(size_t n){
+    if (n == 0) return 0;
+    /* пусть будет 16-байтное выравнивание для простоты,
+       крупные блоки округлим до страницы, чтобы не фрагментить сильно */
+    uint32_t need = (uint32_t)n;
+    if (need >= 4096) need = align4k(need);
+    else              need = (need + 15u) & ~15u;
+
+    if (brk + need > endh) return 0;
+    void* p = brk;
+    brk += need;
+    memset(p, 0, need);
+    return p;
+}
+
+void* kcalloc(size_t n, size_t sz){
+    size_t bytes = n * sz;
+    return kmalloc(bytes);
+}
+
+void* krealloc(void* old, size_t newsize){
+    if (!old) return kmalloc(newsize);
+    void* p = kmalloc(newsize);
+    // без информации о старом размере просто не копируем; для демо достаточно
+    return p;
+}
+
+void kfree(void* p){ (void)p; /* бамп-аллокатор: free игнорируем */ }
+
+interrupts.c
+#include <stdint.h>
+#include "tty.h"
+#include "util.h"
+
+/* ---------------- IDT структуры ---------------- */
+struct idt_entry {
+    uint16_t off1;
+    uint16_t sel;
+    uint8_t  zero;
+    uint8_t  type;
+    uint16_t off2;
+} __attribute__((packed));
+
+struct idt_ptr_t {
+    uint16_t limit;
+    uint32_t base;
+} __attribute__((packed));
+
+static struct idt_entry idt[256];
+struct idt_ptr_t idt_ptr;
+
+extern void idt_load(void);
+
+/* Внешние метки из isr_stub.asm */
+extern void isr0();  extern void isr1();  extern void isr2();  extern void isr3();
+extern void isr4();  extern void isr5();  extern void isr6();  extern void isr7();
+extern void isr8();  extern void isr9();  extern void isr10(); extern void isr11();
+extern void isr12(); extern void isr13(); extern void isr14(); extern void isr15();
+extern void isr16(); extern void isr17(); extern void isr18(); extern void isr19();
+extern void isr20(); extern void isr21(); extern void isr22(); extern void isr23();
+extern void isr24(); extern void isr25(); extern void isr26(); extern void isr27();
+extern void isr28(); extern void isr29(); extern void isr30(); extern void isr31();
+
+extern void irq0(); extern void irq1();
+extern void int80();
+
+/* syscalls */
+extern uint32_t sys_dispatch(uint32_t no, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
+
+/* портовые функции */
+static inline void outb(uint16_t p, uint8_t v){ __asm__ __volatile__("outb %0,%1"::"a"(v),"Nd"(p)); }
+static inline uint8_t inb(uint16_t p){ uint8_t r; __asm__ __volatile__("inb %1,%0":"=a"(r):"Nd"(p)); return r; }
+
+/* записать IDT gate */
+static void set_gate(int n, uint32_t off){
+    idt[n].off1 = off & 0xFFFF;
+    idt[n].sel  = 0x08;      /* kernel code segment */
+    idt[n].zero = 0;
+    idt[n].type = 0x8E;      /* present, DPL=0, 32-bit interrupt gate */
+    idt[n].off2 = (off >> 16) & 0xFFFF;
+}
+
+void idt_init(void){
+    memset(idt, 0, sizeof(idt));
+
+    /* ISRs 0..31 */
+    set_gate(0, (uint32_t)isr0);  set_gate(1, (uint32_t)isr1);
+    set_gate(2, (uint32_t)isr2);  set_gate(3, (uint32_t)isr3);
+    set_gate(4, (uint32_t)isr4);  set_gate(5, (uint32_t)isr5);
+    set_gate(6, (uint32_t)isr6);  set_gate(7, (uint32_t)isr7);
+    set_gate(8, (uint32_t)isr8);  set_gate(9, (uint32_t)isr9);
+    set_gate(10,(uint32_t)isr10); set_gate(11,(uint32_t)isr11);
+    set_gate(12,(uint32_t)isr12); set_gate(13,(uint32_t)isr13);
+    set_gate(14,(uint32_t)isr14); set_gate(15,(uint32_t)isr15);
+    set_gate(16,(uint32_t)isr16); set_gate(17,(uint32_t)isr17);
+    set_gate(18,(uint32_t)isr18); set_gate(19,(uint32_t)isr19);
+    set_gate(20,(uint32_t)isr20); set_gate(21,(uint32_t)isr21);
+    set_gate(22,(uint32_t)isr22); set_gate(23,(uint32_t)isr23);
+    set_gate(24,(uint32_t)isr24); set_gate(25,(uint32_t)isr25);
+    set_gate(26,(uint32_t)isr26); set_gate(27,(uint32_t)isr27);
+    set_gate(28,(uint32_t)isr28); set_gate(29,(uint32_t)isr29);
+    set_gate(30,(uint32_t)isr30); set_gate(31,(uint32_t)isr31);
+
+    /* IRQ0..1 (после ремапа PIC будут на 0x20/0x21) */
+    set_gate(32,(uint32_t)irq0);
+    set_gate(33,(uint32_t)irq1);
+
+    /* системные вызовы */
+    set_gate(0x80,(uint32_t)int80);
+
+    idt_ptr.limit = sizeof(idt) - 1;
+    idt_ptr.base  = (uint32_t)idt;
+    idt_load();
+}
+
+/* PIC remap */
+void pic_init(void){
+    outb(0x20,0x11); outb(0xA0,0x11);
+    outb(0x21,0x20); outb(0xA1,0x28);
+    outb(0x21,0x04); outb(0xA1,0x02);
+    outb(0x21,0x01); outb(0xA1,0x01);
+    outb(0x21,0xFC); outb(0xA1,0xFF); /* разрешим IRQ0/1 */
+}
+static inline void pic_eoi_master(){ outb(0x20,0x20); }
+
+/* хуки */
+extern void pit_on_tick(void);
+extern void kb_on_irq(void);
+
+/* Порядок pusha в regs:
+   regs[0]=EAX, [1]=ECX, [2]=EDX, [3]=EBX, [4]=ESP, [5]=EBP, [6]=ESI, [7]=EDI,
+   затем мы ещё сохраняли GS,FS,ES,DS (их можно игнорировать здесь).
+*/
+void isr_handler_c(uint32_t intno, uint32_t* regs){
+    if (intno == 32) { pit_on_tick(); pic_eoi_master(); return; }
+    if (intno == 33) { kb_on_irq();   pic_eoi_master(); return; }
+
+    if (intno == 0x80) {
+        /* syscall: no = EAX, a=EBX, b=ECX, c=EDX */
+        uint32_t no = regs[0];
+        uint32_t a  = regs[3];
+        uint32_t b  = regs[1];
+        uint32_t c  = regs[2];
+        uint32_t ret = sys_dispatch(no, a, b, c, 0);
+        regs[0] = ret;  /* положили в сохранённый EAX, popa вернёт его в caller */
+        return;
+    }
+    if (intno == 14) { // Page Fault
+        uint32_t cr2;
+        __asm__ __volatile__("mov %%cr2, %0" : "=r"(cr2));
+        vga_puts("\n#PF @");
+        vga_puthex(cr2);
+        while (1) { __asm__ __volatile__("cli; hlt"); }
+    }
+
+    /* Остальные исключения — просто залогируем номер */
+    vga_puts("\n#EXC ");
+    vga_puthex(intno);
+
+}
+
+isr_stub.asm
+[bits 32]
+section .text
+
+; C-обработчик:
+; void isr_handler_c(uint32_t intno, uint32_t* regs);
+extern isr_handler_c
+
+; -------------------------------
+; Общий шаблон без кода ошибки
+; -------------------------------
+%macro ISR_NOERR 1
+global isr%1
+isr%1:
+    pusha                   ; EAX,ECX,EDX,EBX,ESP,EBP,ESI,EDI
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10            ; ядровые сегменты (селектор code/data = 0x08/0x10)
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov eax, esp            ; regs* указывает на область, сохранённую pusha/seg
+    push eax                ; arg2: regs*
+    push dword %1           ; arg1: intno
+    call isr_handler_c
+    add esp, 8
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    iretd
+%endmacro
+
+; -------------------------------
+; Шаблон для исключений с кодом ошибки
+; CPU кладёт error code перед возвратным кадром.
+; Мы его не используем, но обязаны убрать со стека перед IRETD.
+; -------------------------------
+%macro ISR_ERR 1
+global isr%1
+isr%1:
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov eax, esp
+    push eax                ; arg2: regs*
+    push dword %1           ; arg1: intno
+    call isr_handler_c
+    add esp, 8
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    add esp, 4              ; <<< снять error code, который положил CPU
+    iretd
+%endmacro
+
+; --------
+; ISRs 0..31
+; Исключения с error code: 8, 10, 11, 12, 13, 14, 17
+; --------
+ISR_NOERR 0     ; #DE
+ISR_NOERR 1     ; #DB
+ISR_NOERR 2     ; NMI
+ISR_NOERR 3     ; #BP
+ISR_NOERR 4     ; #OF
+ISR_NOERR 5     ; #BR
+ISR_NOERR 6     ; #UD
+ISR_NOERR 7     ; #NM
+ISR_ERR   8     ; #DF (error code = 0)
+ISR_NOERR 9     ; Coprocessor Segment Overrun (legacy)
+ISR_ERR   10    ; #TS
+ISR_ERR   11    ; #NP
+ISR_ERR   12    ; #SS
+ISR_ERR   13    ; #GP
+ISR_ERR   14    ; #PF
+ISR_NOERR 15
+ISR_NOERR 16    ; #MF
+ISR_ERR   17    ; #AC
+ISR_NOERR 18    ; #MC
+ISR_NOERR 19    ; #XM
+ISR_NOERR 20
+ISR_NOERR 21
+ISR_NOERR 22
+ISR_NOERR 23
+ISR_NOERR 24
+ISR_NOERR 25
+ISR_NOERR 26
+ISR_NOERR 27
+ISR_NOERR 28
+ISR_NOERR 29
+ISR_NOERR 30
+ISR_NOERR 31
+
+; --------
+; IRQ0..1 (после ремапа: 32,33)
+; --------
+global irq0, irq1
+irq0:
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov eax, esp
+    push eax                ; regs*
+    push dword 32           ; intno
+    call isr_handler_c
+    add esp, 8
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    iretd
+
+irq1:
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov eax, esp
+    push eax
+    push dword 33
+    call isr_handler_c
+    add esp, 8
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    iretd
+
+; --------
+; int 0x80 — системные вызовы (без error code)
+; --------
+global int80
+int80:
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov eax, esp
+    push eax                ; regs*
+    push dword 0x80         ; intno
+    call isr_handler_c
+    add esp, 8
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    iretd
+
+keyboard.c
+// kernel/keyboard.c
+#include <stdint.h>
+
+/* Порты контроллера клавиатуры */
+#define KBD_DATA  0x60
+#define KBD_STAT  0x64
+
+static inline uint8_t inb(uint16_t p){ uint8_t v; __asm__ __volatile__("inb %1,%0":"=a"(v):"Nd"(p)); return v; }
+
+/* public keycodes (совместимы с ASCII там, где возможно) */
+enum {
+    KB_NONE = -1,
+    KB_ENTER = '\n',
+    KB_BACKSPACE = 8,
+    KB_LEFT = 256, KB_RIGHT, KB_UP, KB_DOWN, KB_HOME, KB_END, KB_DEL
+};
+
+/* Таблицы scancode set 1: обычная и с Shift */
+static const char keymap[128] = {
+/*00*/ 0,  27,'1','2','3','4','5','6','7','8','9','0','-','=', '\b',
+/*0F*/ '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',  0,
+/*1F*/ 'a','s','d','f','g','h','j','k','l',';','\'','`',  0, '\\',
+/*2F*/ 'z','x','c','v','b','n','m',',','.','/',  0,   '*', 0,  ' ',
+/*39*/  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   0,    0,  0,   0,
+/*49*/  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   0,    0,  0,   0,
+/*59*/  0,  0,  0,  0,  0,  0,  0,  0
+};
+
+static const char keymap_shift[128] = {
+/*00*/ 0,  27,'!','@','#','$','%','^','&','*','(',')','_','+', '\b',
+/*0F*/ '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',  0,
+/*1F*/ 'A','S','D','F','G','H','J','K','L',':','"','~',  0,  '|',
+/*2F*/ 'Z','X','C','V','B','N','M','<','>','?',  0,   '*', 0,  ' ',
+/*39*/  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   0,    0,  0,   0,
+/*49*/  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,   0,    0,  0,   0,
+/*59*/  0,  0,  0,  0,  0,  0,  0,  0
+};
+
+/* Состояние модификаторов */
+static volatile int shift = 0;
+static volatile int caps  = 0;
+/* E0-префикс (клавиши курсора/Ins/Delete...) */
+static volatile int e0_prefix = 0;
+
+/* Очередь «последняя клавиша» */
+static volatile int last_key = KB_NONE;
+
+/* --- API --- */
+void kb_init(void){
+    /* Сбросим мусор из буфера контроллера */
+    for(int i=0;i<16;i++){
+        uint8_t st = inb(KBD_STAT);
+        if(st & 1) (void)inb(KBD_DATA);
+    }
+    shift = 0; caps = 0; e0_prefix = 0; last_key = KB_NONE;
+}
+
+void kb_on_irq(void){
+    uint8_t sc = inb(KBD_DATA);
+
+    if (sc == 0xE0) { e0_prefix = 1; return; }   /* расширенный код */
+    if (sc & 0x80) {                              /* break-code */
+        uint8_t make = sc & 0x7F;
+        if (!e0_prefix) {
+            if (make==0x2A || make==0x36) shift = 0;  /* L/R Shift release */
+        }
+        e0_prefix = 0;
+        return;
+    }
+
+    if (e0_prefix) {
+        e0_prefix = 0;
+        /* Стрелки/дом/енд/делит из набора E0 */
+        switch (sc) {
+            case 0x4B: last_key = KB_LEFT;  return;
+            case 0x4D: last_key = KB_RIGHT; return;
+            case 0x48: last_key = KB_UP;    return;
+            case 0x50: last_key = KB_DOWN;  return;
+            case 0x47: last_key = KB_HOME;  return;
+            case 0x4F: last_key = KB_END;   return;
+            case 0x53: last_key = KB_DEL;   return;
+            default: return;
+        }
+    }
+
+    /* Make codes обычные */
+    if (sc == 0x2A || sc == 0x36) { shift = 1; return; }       /* L/R Shift press */
+    if (sc == 0x3A) { caps ^= 1; return; }                     /* Caps toggle */
+
+    char c = (shift ? keymap_shift[sc] : keymap[sc]);
+    if (!shift && caps && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    if (c) {
+        if (c == '\n') last_key = KB_ENTER;
+        else           last_key = (int)c;
+    }
+}
+
+int kb_getkey(void){
+    int k = last_key;
+    last_key = KB_NONE;
+    return k;
+}
+
+keyboard.h
+// kernel/keyboard.h
+#pragma once
+#ifndef KB_TAB
+#define KB_TAB 9   /* ASCII '\t' */
+#endif
+/* публичные коды клавиш (ASCII там, где возможно) */
+enum {
+    KB_NONE = -1,
+    KB_ENTER = '\n',
+    KB_BACKSPACE = 8,
+    KB_LEFT = 256, KB_RIGHT, KB_UP, KB_DOWN, KB_HOME, KB_END, KB_DEL
+};
+
+/* API клавиатуры */
+void kb_init(void);
+int  kb_getkey(void);
+
+kmain.c
+// kernel/kmain.c
+#include <stdint.h>
+#include <string.h>      // strlen, strncpy, memcpy
+#include "tty.h"
+#include "util.h"
+#include "keyboard.h"    // KB_* , kb_getkey()
+#include "fs/vfs.h"      // vfs_* API
+
+/* ---- Инициализация подсистем ---- */
+void gdt_init(void);
+void paging_enable_identity_16mb(void);
+void idt_init(void);
+void pic_init(void);
+void pit_init(void);
+void kb_init(void);
+
+/* ---- Планировщик/треды ---- */
+void  sched_init(void);
+int   thread_create(void (*entry)(void), const char* name);
+void  sched_start(void);
+
+/* ---- Демонстрационный тред ---- */
+void user_ticks(void);
+
+/* ================== Конфигурация шелла ================== */
+#define SHELL_BUFSZ      128
+#define HIST_MAX         16
+#define NAME_MAX         64
+#define MATCH_MAX        32
+
+/* встройка команд (для автодополнения) */
+static const char* const builtins[] = {
+    "help","dir","ls","type","copy","del","ren","cls","clear",
+    "echo","mem","ver","ticks","halt", 0
+};
+
+/* ===== История команд ===== */
+static char history[HIST_MAX][SHELL_BUFSZ];
+static int  hist_cnt = 0;     // реально записано
+static int  hist_head = 0;    // индекс для следующей записи (кольцевой)
+static int  hist_view = -1;   // текущая позиция просмотра (-1 = нет)
+
+static void hist_push(const char* s){
+    if (!s || !*s) return;
+    /* не дублировать одинаковые подряд */
+    if (hist_cnt > 0) {
+        int last = (hist_head + HIST_MAX - 1) % HIST_MAX;
+        if (strcmp(history[last], s) == 0) return;
+    }
+    strncpy(history[hist_head], s, SHELL_BUFSZ-1);
+    history[hist_head][SHELL_BUFSZ-1] = 0;
+    hist_head = (hist_head + 1) % HIST_MAX;
+    if (hist_cnt < HIST_MAX) hist_cnt++;
+}
+
+static const char* hist_get(int idx_from_oldest){
+    if (idx_from_oldest < 0 || idx_from_oldest >= hist_cnt) return 0;
+    int oldest = (hist_head - hist_cnt + HIST_MAX) % HIST_MAX;
+    int real   = (oldest + idx_from_oldest) % HIST_MAX;
+    return history[real];
+}
+
+/* ===== Перерисовка хвоста строки ===== */
+static void redraw_from(const char* buf, int len, int from, uint16_t startpos, int clear_one){
+    vga_cursor_off();
+    vga_move_to(startpos + from);
+    for (int i = from; i < len; ++i) vga_putchar(buf[i]);
+    if (clear_one) vga_putchar(' ');
+    vga_cursor_move(startpos + from);
+}
+
+/* ====== помощники строки ====== */
+static int is_space(int c){ return c==' ' || c=='\t'; }
+
+/* вернёт начало текущего токена (после последнего пробела) */
+static int token_start(const char* buf, int len, int cur){
+    (void)len; // параметр не нужен
+    int i = cur;
+    while (i>0 && !is_space(buf[i-1])) --i;
+    return i;
+}
+
+/* распечатать приглашение заново (для листинга вариантов) */
+static void prompt(uint16_t* p_startpos){
+    vga_puts("> ");
+    *p_startpos = vga_getpos();
+}
+
+/* собрать кандидаты: команды + (опционально) файлы из VFS */
+static int collect_matches(const char* pref, char out[][NAME_MAX], int max, int want_cmds, int want_files){
+    int n = 0;
+
+    if (want_cmds) {
+        for (int i=0; builtins[i]; ++i){
+            if (strncmp(builtins[i], pref, strlen(pref))==0 && n<max){
+                strncpy(out[n], builtins[i], NAME_MAX-1);
+                out[n][NAME_MAX-1]=0; n++;
+            }
+        }
+    }
+
+    if (want_files) {
+#ifdef HAVE_VFS_LIST_MATCHES
+        n += vfs_list_matches(pref, &out[n], max-n);
+#else
+        (void)pref; (void)out; (void)max;
+#endif
+    }
+    return n;
+}
+
+/* вставить в буфер строку s на позиции cur (сдвигая хвост) */
+static void insert_str(char* buf, int* p_len, int* p_cur, int bufsz, const char* s){
+    int cur=*p_cur, len=*p_len;
+    int add = (int)strlen(s);
+    if (len + add >= bufsz) add = bufsz-1-len;
+    if (add<=0) return;
+    for (int i=len-1;i>=cur;--i) buf[i+add]=buf[i];
+    memcpy(buf+cur, s, add);
+    len += add; cur += add;
+    buf[len]=0;
+    *p_len=len; *p_cur=cur;
+}
+
+/* ===================== DOS-подобный шелл ===================== */
+static void shell(void) {
+    vga_puts("\nType 'help'.\n");
+    uint16_t startpos; prompt(&startpos);
+
+    char buf[SHELL_BUFSZ] = {0};
+    int  len = 0, cur = 0;
+
+    vga_cursor_move(startpos);
+
+    for (;;) {
+        int k = kb_getkey();
+        if (k == KB_NONE) { __asm__ __volatile__("hlt"); continue; }
+
+        if (k == KB_ENTER) {
+            vga_cursor_off();
+            vga_move_to(startpos + len);
+            vga_putchar('\n');
+            buf[len] = 0;
+
+            /* история */
+            hist_push(buf);
+            hist_view = -1;
+
+            /* --- команды --- */
+            if (buf[0] == 0) {
+                /* пусто */
+            }
+            else if (strcmp(buf,"help")==0) {
+                vga_puts("help, dir, type <f>, copy <a> <b>, del <f>, ren <a> <b>, cls, echo <t>, mem, ver, ticks, halt\n");
+            }
+            else if (strcmp(buf,"dir")==0 || strcmp(buf,"ls")==0) {
+                vfs_ls();
+            }
+            else if (strncmp(buf,"type ",5)==0) {
+                const char* p=buf+5; while(*p==' ') p++;
+                const char* s=vfs_read(p);
+                vga_puts(s? s : "file not found\n");
+            }
+            else if (strncmp(buf,"copy ",5)==0) {
+                char a[64]={0}, b[64]={0};
+                const char* p=buf+5; while(*p==' ') p++;
+                int i=0; while(*p && *p!=' ' && i<63){ a[i++]=*p++; }
+                while(*p==' ') p++;
+                i=0; while(*p && i<63){ b[i++]=*p++; }
+                const char* s=vfs_read(a);
+                if(!s) vga_puts("source not found\n");
+                else if(vfs_write(b,s,strlen(s),0)==0) vga_puts("copied\n");
+                else vga_puts("copy failed\n");
+            }
+            else if (strncmp(buf,"del ",4)==0) {
+                const char* p=buf+4; while(*p==' ') p++;
+                vga_puts(vfs_delete(p)==0 ? "deleted\n" : "no such file\n");
+            }
+            else if (strncmp(buf,"ren ",4)==0) {
+                char a[64]={0}, b[64]={0};
+                const char* p=buf+4; while(*p==' ') p++;
+                int i=0; while(*p && *p!=' ' && i<63){ a[i++]=*p++; }
+                while(*p==' ') p++;
+                i=0; while(*p && i<63){ b[i++]=*p++; }
+                vga_puts(vfs_rename(a,b)==0 ? "renamed\n" : "rename failed\n");
+            }
+            else if (strcmp(buf,"cls")==0 || strcmp(buf,"clear")==0) {
+                vga_clear();
+            }
+            else if (strncmp(buf,"echo ",5)==0) {
+                const char* p=buf+5; while(*p==' ') p++; vga_puts(p); vga_puts("\n");
+            }
+            else if (strcmp(buf,"mem")==0) {
+                size_t tot,used; int files; vfs_stat(&tot,&used,&files);
+                vga_puts("RAMFS total: "); vga_putdec((uint32_t)tot);
+                vga_puts(" used: ");       vga_putdec((uint32_t)used);
+                vga_puts(" files: ");      vga_putdec((uint32_t)files);
+                vga_puts("\n");
+            }
+            else if (strcmp(buf,"ver")==0) {
+                vga_puts("nano-os DOS-like shell 0.4\n");
+            }
+            else if (strcmp(buf,"ticks")==0) {
+                thread_create(user_ticks,"ticks");
+            }
+            else if (strcmp(buf,"halt")==0) {
+                vga_puts("halt\n"); while(1){ __asm__ __volatile__("hlt"); }
+            }
+            else {
+                vga_puts("?\n");
+            }
+
+            /* новая строка ввода */
+            prompt(&startpos);
+            buf[0]=0; len=0; cur=0;
+            vga_cursor_move(startpos);
+            continue;
+        }
+
+        /* --- история (↑/↓) --- */
+        if (k == KB_UP || k == KB_DOWN){
+            if (hist_cnt == 0) continue;
+
+            if (hist_view < 0) hist_view = hist_cnt;         // "пустая строка" после последней
+            if (k == KB_UP)   { if (hist_view > 0) hist_view--; }
+            else              { if (hist_view < hist_cnt) hist_view++; }
+
+            vga_cursor_off();
+            /* очистить текущую строку (перерисовать пробелами) */
+            vga_move_to(startpos);
+            for (int i=0;i<len;i++) vga_putchar(' ');
+            vga_move_to(startpos);
+
+            if (hist_view == hist_cnt) {
+                buf[0]=0; len=cur=0;
+            } else {
+                const char* h = hist_get(hist_view);
+                strncpy(buf, h, SHELL_BUFSZ-1);
+                buf[SHELL_BUFSZ-1]=0;
+                len = cur = (int)strlen(buf);
+                for (int i=0;i<len;i++) vga_putchar(buf[i]);
+            }
+            vga_cursor_move(startpos + cur);
+            continue;
+        }
+
+        /* --- Tab-completion --- */
+#ifdef KB_TAB
+        if (k == KB_TAB || k == '\t')
+#else
+        if (k == '\t')
+#endif
+        {
+            /* определить текущий токен */
+            int t0 = token_start(buf, len, cur);
+            int on_cmd = (t0 == 0);              // первый токен → команды
+            char pref[NAME_MAX]={0};
+            int preflen = cur - t0;
+            if (preflen > NAME_MAX-1) preflen = NAME_MAX-1;
+            memcpy(pref, buf + t0, preflen); pref[preflen]=0;
+
+            char cand[MATCH_MAX][NAME_MAX];
+            int n = collect_matches(pref, cand, MATCH_MAX, /*cmds*/on_cmd, /*files*/!on_cmd);
+
+            if (n == 0){
+#ifndef HAVE_VFS_LIST_MATCHES
+                if (!on_cmd){ vga_putchar('\n'); vfs_ls(); prompt(&startpos); }
+#endif
+                /* восстановить строку */
+                vga_cursor_off();
+                vga_move_to(startpos);
+                for (int i=0;i<len;i++) vga_putchar(buf[i]);
+                vga_cursor_move(startpos + cur);
+                continue;
+            }
+            if (n == 1){
+                /* единственный кандидат → дописать суффикс */
+                const char* full = cand[0];
+                const char* suf  = full + preflen;
+                insert_str(buf, &len, &cur, SHELL_BUFSZ, suf);
+                redraw_from(buf, len, t0, startpos, /*clear_one=*/0);
+                vga_cursor_move(startpos + cur);
+                continue;
+            }
+
+            /* несколько кандидатов: вывести одной строкой и восстановить ввод */
+            vga_putchar('\n');
+            for (int i=0;i<n;i++){
+                vga_puts(cand[i]);
+                if (i+1<n) vga_puts("  ");
+            }
+#ifndef HAVE_VFS_LIST_MATCHES
+            if (!on_cmd) { vga_puts("  "); vga_puts("(dir for all files)"); }
+#endif
+            vga_putchar('\n');
+            prompt(&startpos);
+            vga_cursor_off();
+            vga_move_to(startpos);
+            for (int i=0;i<len;i++) vga_putchar(buf[i]);
+            vga_cursor_move(startpos + cur);
+            continue;
+        }
+
+        /* --- навигация и редактирование --- */
+        switch (k) {
+            case KB_LEFT:
+                if (cur>0) { cur--; vga_cursor_move(startpos + cur); }
+                break;
+            case KB_RIGHT:
+                if (cur<len){ cur++; vga_cursor_move(startpos + cur); }
+                break;
+            case KB_HOME:
+                cur = 0; vga_cursor_move(startpos + cur);
+                break;
+            case KB_END:
+                cur = len; vga_cursor_move(startpos + cur);
+                break;
+            case KB_BACKSPACE:
+                if (cur>0) {
+                    cur--;
+                    for (int i=cur; i<len-1; ++i) buf[i]=buf[i+1];
+                    len--;
+                    redraw_from(buf, len, cur, startpos, /*clear_one=*/1);
+                    vga_cursor_move(startpos + cur);
+                }
+                break;
+            case KB_DEL:
+                if (cur<len) {
+                    for (int i=cur; i<len-1; ++i) buf[i]=buf[i+1];
+                    len--;
+                    redraw_from(buf, len, cur, startpos, /*clear_one=*/1);
+                    vga_cursor_move(startpos + cur);
+                }
+                break;
+            default:
+                if (k>=32 && k<127 && len < SHELL_BUFSZ-1) {
+                    vga_cursor_off();
+                    for (int i=len; i>cur; --i) buf[i]=buf[i-1];
+                    buf[cur] = (char)k;
+                    len++; cur++;
+                    vga_move_to(startpos + (cur-1));
+                    for (int i = cur-1; i < len; ++i) vga_putchar(buf[i]);
+                    vga_cursor_move(startpos + cur);
+                }
+                break;
+        }
+    }
+}
+
+/* ===================== Точка входа ядра ===================== */
+void kmain(uint32_t multiboot_magic, uint32_t multiboot_info) {
+    (void)multiboot_magic; (void)multiboot_info;
+
+    vga_setcolor(0x0F);
+    vga_clear();
+    vga_puts("nano-os: hello!\n");
+    vga_cursor_on();  // включаем софт-курсор
+
+    gdt_init();
+    paging_enable_identity_16mb();
+    idt_init(); pic_init(); pit_init(); kb_init();
+
+    vfs_init();
+
+    __asm__ __volatile__("sti");
+
+    sched_init();
+    thread_create(shell, "shell");
+    sched_start();
+
+    while (1) { __asm__ __volatile__("hlt"); }
+}
+
+paging.c
+#include <stdint.h>
+#include "util.h"
+
+/* Каталог страниц и 4 таблицы по 4К записей (4К*4К = 16МиБ) */
+static uint32_t __attribute__((aligned(4096))) pgdir[1024];
+static uint32_t __attribute__((aligned(4096))) pt0[1024];
+static uint32_t __attribute__((aligned(4096))) pt1[1024];
+static uint32_t __attribute__((aligned(4096))) pt2[1024];
+static uint32_t __attribute__((aligned(4096))) pt3[1024];
+
+void paging_enable_identity_16mb(void)
+{
+    /* обнулим каталог */
+    for (int i = 0; i < 1024; i++) pgdir[i] = 0;
+
+    /* Заполним 4 таблицы: каждая покрывает 4МиБ диапазон */
+    for (int i = 0; i < 1024; i++) {
+        pt0[i] = ((uint32_t)(i * 0x1000u)            ) | 0x3; /* P|RW */
+        pt1[i] = ((uint32_t)(i * 0x1000u + 0x00400000)) | 0x3;
+        pt2[i] = ((uint32_t)(i * 0x1000u + 0x00800000)) | 0x3;
+        pt3[i] = ((uint32_t)(i * 0x1000u + 0x00C00000)) | 0x3;
+    }
+
+    /* Каталог: первые 4 PDE указывают на наши таблицы */
+    pgdir[0] = ((uint32_t)pt0) | 0x3;
+    pgdir[1] = ((uint32_t)pt1) | 0x3;
+    pgdir[2] = ((uint32_t)pt2) | 0x3;
+    pgdir[3] = ((uint32_t)pt3) | 0x3;
+
+    /* Загрузим CR3 и включим PG в CR0 */
+    __asm__ __volatile__("mov %0, %%cr3" :: "r"(pgdir) : "memory");
+    uint32_t cr0;
+    __asm__ __volatile__("mov %%cr0, %0" : "=r"(cr0));
+    cr0 |= (1u << 31);
+    __asm__ __volatile__("mov %0, %%cr0" :: "r"(cr0) : "memory");
+}
+
+pit.c
+#include <stdint.h>
+#include "tty.h"
+
+static inline void outb(uint16_t p, uint8_t v){ __asm__ __volatile__("outb %0,%1"::"a"(v),"Nd"(p)); }
+
+volatile uint64_t jiffies=0;
+
+void pit_init(){
+    uint16_t div=11932; // ~100Hz
+    outb(0x43,0x36);
+    outb(0x40,div&0xFF);
+    outb(0x40,div>>8);
+}
+
+extern void sched_tick();
+
+void pit_on_tick(){
+    jiffies++;
+    sched_tick();
+}
+
+shed.c
+// kernel/sched.c (замени только места с базовым адресом стека)
+#include <stdint.h>
+#include "tty.h"
+#include "util.h"
+
+#define MAX_THREADS 16
+typedef struct ctx_t { uint32_t esp, ebp, ebx, esi, edi, eip; } ctx_t;
+typedef enum { UNUSED, READY, RUNNING } tstate;
+
+typedef struct thread {
+    ctx_t ctx;
+    uint8_t *kstack;
+    tstate st;
+    char name[16];
+} thread_t;
+
+static thread_t th[MAX_THREADS];
+static int current = -1;
+
+extern void ctx_switch(ctx_t* old, ctx_t* new);
+
+void sched_init(){
+    memset(th,0,sizeof(th));
+}
+
+int thread_create(void (*entry)(void), const char* name){
+    for(int i=0;i<MAX_THREADS;i++){
+        if(th[i].st==UNUSED){
+            // РАНЬШЕ: 0x01000000 (16МиБ) → могло ловить #PF при identity-мэппинге 0..4МиБ.
+            // ТЕПЕРЬ: кладём в 2..3МиБ (замаплено), по 16К на поток.
+            th[i].kstack = (uint8_t*)0x00200000 + i*0x4000;
+            uint32_t *sp = (uint32_t*)(th[i].kstack + 0x4000);
+            *(--sp) = (uint32_t)entry;  // eip при первом входе
+            th[i].ctx.eip = (uint32_t)entry;
+            th[i].ctx.esp = (uint32_t)sp;
+            th[i].st = READY;
+            memset(th[i].name,0,16); for(int j=0;j<15&&name[j];j++) th[i].name[j]=name[j];
+            return i;
+        }
+    }
+    return -1;
+}
+
+void sched_tick(){
+    int start = current;
+    for(int i=1;i<=MAX_THREADS;i++){
+        int n = (start+i)%MAX_THREADS;
+        if(th[n].st==READY){ int prev=current; int next=n;
+            if(prev==next){ th[next].st=RUNNING; return; }
+            th[next].st=RUNNING;
+            int p=prev;
+            current=next;
+            if(p>=0){
+                th[p].st=READY;
+                ctx_switch(&th[p].ctx, &th[next].ctx);
+            } else {
+                ctx_switch(&(ctx_t){0}, &th[next].ctx);
+            }
+            return;
+        }
+    }
+}
+
+void sched_start(){
+    sched_tick();
+    while(1){ __asm__ __volatile__("hlt"); }
+}
+syscalls.c
+#include <stdint.h>
+#include "tty.h"
+
+/* Таблица системных вызовов: прототип */
+typedef uint32_t (*sys_t)(uint32_t a, uint32_t b, uint32_t c, uint32_t d);
+
+/* --- Реализации syscalls --- */
+
+/* sys_write(no=0): пишет len байт из ptr на экран, возвращает len */
+static uint32_t sys_write(uint32_t ptr, uint32_t len, uint32_t unused1, uint32_t unused2) {
+    (void)unused1; (void)unused2;
+    const char* s = (const char*)ptr;
+    for (uint32_t i = 0; i < len; i++) vga_putchar(s[i]);
+    return len;
+}
+
+/* sys_time(no=1): возвращает младшие 32 бита тиков PIT */
+extern volatile uint64_t jiffies;
+static uint32_t sys_time(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    (void)a; (void)b; (void)c; (void)d;
+    return (uint32_t)jiffies;
+}
+
+/* Таблица */
+static sys_t sys_table[] = {
+    sys_write, /* 0 */
+    sys_time   /* 1 */
+};
+#define SYS_MAX ((uint32_t)(sizeof(sys_table)/sizeof(sys_table[0])))
+
+/* Диспетчер: вызывайте из обработчика int 0x80
+   no = номер вызова, a..d = аргументы */
+uint32_t sys_dispatch(uint32_t no, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+    if (no >= SYS_MAX) return (uint32_t)-1;
+    return sys_table[no](a, b, c, d);
+}
+
+tty.h
+// kernel/tty.h
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+
+void     vga_clear(void);
+void     vga_setcolor(uint8_t color);
+void     vga_putchar(char c);
+void     vga_puts(const char* s);
+void     vga_puthex(uint32_t x);
+void     vga_putdec(uint32_t x);
+
+uint16_t vga_getpos(void);
+void     vga_setcursor(uint16_t pos);
+void     vga_move_to(uint16_t pos);
+
+void     vga_cursor_on(void);
+void     vga_cursor_off(void);
+void     vga_cursor_move(uint16_t pos);
+
+util.c
+#include "util.h"
+void *memset(void* d,int v,size_t n){unsigned char* p=d;while(n--)*p++=(unsigned char)v;return d;}
+void *memcpy(void* d,const void* s,size_t n){unsigned char* D=d;const unsigned char*S=s;while(n--)*D++=*S++;return d;}
+size_t strlen(const char* s){size_t n=0;while(*s++)n++;return n;}
+int strcmp(const char*a,const char*b){while(*a&&(*a==*b)){a++;b++;}return *(unsigned char*)a-*(unsigned char*)b;}
+int strncmp(const char*a,const char*b,size_t n){while(n&&*a&&(*a==*b)){a++;b++;n--;}return n?*(unsigned char*)a-*(unsigned char*)b:0;}
+util.h
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+void *memset(void*, int, size_t);
+void *memcpy(void*, const void*, size_t);
+size_t strlen(const char*);
+int strcmp(const char*, const char*);
+int strncmp(const char*, const char*, size_t);
+
+vga.c
+// kernel/vga.c
+#include <stdint.h>
+#include "util.h"
+
+#define VGA_MEM   ((uint16_t*)0xB8000)
+#define VGA_W     80
+#define VGA_H     25
+
+/* Логический курсор и цвет */
+static uint8_t cx = 0, cy = 0;
+static uint8_t color = 0x0F;
+
+/* ===== Аппаратный курсор (будем выключать) ===== */
+static inline void hw_setcursor(uint16_t pos){
+    uint8_t hi = (pos >> 8) & 0xFF;
+    uint8_t lo =  pos       & 0xFF;
+    __asm__ __volatile__(
+        "movb $0x0E, %%al; outb %%al, $0x3D4;"
+        "movb %0,    %%al; outb %%al, $0x3D5;"
+        "movb $0x0F, %%al; outb %%al, $0x3D4;"
+        "movb %1,    %%al; outb %%al, $0x3D5;"
+        :: "r"(hi), "r"(lo) : "al"
+    );
+}
+static inline void hw_cursor_enable(int on){
+    /* CRTC index 0x0A (Cursor Start), bit 5 = 1 -> disable */
+    uint8_t val;
+    __asm__ __volatile__(
+        "movb $0x0A, %%al; outb %%al, $0x3D4; inb $0x3D5, %%al;"
+        "movb %%al, %0;"
+        : "=r"(val) :: "al"
+    );
+    if (on) val &= ~(1<<5); else val |= (1<<5);
+    __asm__ __volatile__(
+        "movb $0x0A, %%al; outb %%al, $0x3D4;"
+        "movb %0,    %%al; outb %%al, $0x3D5;"
+        :: "r"(val) : "al"
+    );
+}
+
+/* ===== Прокрутка ===== */
+static void scroll_up(void){
+    for (int r = 0; r < VGA_H - 1; ++r)
+        for (int x = 0; x < VGA_W; ++x)
+            VGA_MEM[r*VGA_W + x] = VGA_MEM[(r+1)*VGA_W + x];
+    for (int x = 0; x < VGA_W; ++x)
+        VGA_MEM[(VGA_H-1)*VGA_W + x] = (uint16_t)(' ') | ((uint16_t)color << 8);
+}
+
+/* ===== Низкоуровневый вывод ===== */
+static void putc_raw(char ch){
+    if (ch == '\n') {
+        cx = 0;
+        if (++cy >= VGA_H) { cy = VGA_H - 1; scroll_up(); }
+        return;
+    }
+    VGA_MEM[cy*VGA_W + cx] = (uint16_t)ch | ((uint16_t)color << 8);
+    if (++cx >= VGA_W) {
+        cx = 0;
+        if (++cy >= VGA_H) { cy = VGA_H - 1; scroll_up(); }
+    }
+}
+
+/* ===== Публичное API печати ===== */
+void vga_clear(void){
+    for (int i = 0; i < VGA_W*VGA_H; ++i)
+        VGA_MEM[i] = (uint16_t)(' ') | ((uint16_t)color << 8);
+    cx = 0; cy = 0;
+}
+void vga_setcolor(uint8_t c){ color = c; }
+void vga_putchar(char c){ putc_raw(c); }
+void vga_puts(const char* s){ while (*s) putc_raw(*s++); }
+
+void vga_puthex(uint32_t x){
+    static const char* h = "0123456789ABCDEF";
+    for (int i = 7; i >= 0; --i) putc_raw(h[(x >> (i*4)) & 0xF]);
+}
+void vga_putdec(uint32_t x){
+    char buf[11]; int i = 0;
+    if (x == 0){ vga_putchar('0'); return; }
+    while (x){ buf[i++] = (char)('0' + (x % 10)); x /= 10; }
+    while (i--) vga_putchar(buf[i]);
+}
+
+/* ===== ЕДИНЫЙ логический курсор ===== */
+uint16_t vga_getpos(void){ return (uint16_t)cy * VGA_W + cx; }
+void     vga_setcursor(uint16_t pos){ /* совместимость, просто синхронизируем */
+    cy = (uint8_t)(pos / VGA_W);
+    cx = (uint8_t)(pos % VGA_W);
+    if (cy >= VGA_H) cy = VGA_H - 1;
+    if (cx >= VGA_W) cx = VGA_W - 1;
+}
+void     vga_move_to(uint16_t pos){ vga_setcursor(pos); }
+
+/* ===== Software-курсор (инверсия атрибутов клетки) ===== */
+static uint16_t swc_prev_pos = 0xFFFF;
+static uint16_t swc_prev_cell;
+
+void vga_cursor_on(void){
+    hw_cursor_enable(0); /* отключаем HW-курсор */
+}
+void vga_cursor_off(void){
+    /* убрать SW-курсор, если был */
+    if (swc_prev_pos != 0xFFFF){
+        VGA_MEM[swc_prev_pos] = swc_prev_cell;
+        swc_prev_pos = 0xFFFF;
+    }
+}
+void vga_cursor_move(uint16_t pos){
+    /* снять прошлую подсветку */
+    if (swc_prev_pos != 0xFFFF){
+        VGA_MEM[swc_prev_pos] = swc_prev_cell;
+    }
+    /* запомнить клетку и инвертировать атрибуты (XOR 0x70) */
+    swc_prev_pos  = pos;
+    swc_prev_cell = VGA_MEM[pos];
+    uint16_t ch   = swc_prev_cell & 0x00FF;
+    uint16_t attr = (swc_prev_cell & 0xFF00) ^ 0x7000;
+    VGA_MEM[pos]  = ch | attr;
+
+    /* синхронизировать логический курсор для последующего вывода */
+    vga_move_to(pos);
+}
+
+user/
+demo_cat.c
+#include "tty.h"
+#include "util.h"
+const char* vfs_read(const char*);
+
+void user_cat(){
+    const char* s=vfs_read("/hello.txt");
+    if(!s){ vga_puts("no file\n"); return; }
+    vga_puts(s);
+    for(volatile int i=0;i<10000000;i++){}
+}
+
+demo_ticks.c
+#include <stdint.h>
+#include "tty.h"
+extern volatile uint64_t jiffies;
+
+void user_ticks(){
+    uint64_t last=0;
+    while(1){
+        if(jiffies!=last){ last=jiffies; vga_puts("."); }
+        __asm__ __volatile__("hlt");
+    }
+}
+
+
+
+
+
