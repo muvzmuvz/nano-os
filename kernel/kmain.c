@@ -1,18 +1,9 @@
 // kernel/kmain.c
 #include <stdint.h>
-#include <string.h>      // strlen, memcpy (OK в freestanding, но без вызовов strncpy)
 #include "tty.h"
-#include "util.h"
-#include "keyboard.h"
-#include "fs/vfs.h"
-
-/* локальный безопасный копирующий хелпер (без libc) */
-static void k_strlcpy(char* dst, const char* src, int n){
-    if (!dst || n<=0) return;
-    int i=0;
-    while (i < n-1 && src && src[i]) { dst[i] = src[i]; ++i; }
-    dst[i] = 0;
-}
+#include "util.h"        // kstrlen, kmemcpy, kmemset, k_atoi, k_strlcpy, align4k
+#include "keyboard.h"    // KB_* , kb_getkey()
+#include "fs/vfs.h"      // vfs_* API
 
 /* ---- Инициализация подсистем ---- */
 void gdt_init(void);
@@ -30,6 +21,15 @@ void  sched_start(void);
 /* ---- Демонстрационный тред ---- */
 void user_ticks(void);
 
+/* ---- FAT32 адаптер (fs/fat32.c) ---- */
+int         fat_mount_shell(uint8_t drive);
+void        fat_vfs_ls(void);
+const char* fat_vfs_read(const char* path);
+int         fat_is_mounted(void);
+
+/* Символы от линкера — границы ядра */
+extern char end_of_kernel;
+
 /* ================== Конфигурация шелла ================== */
 #define SHELL_BUFSZ      128
 #define HIST_MAX         16
@@ -38,22 +38,25 @@ void user_ticks(void);
 
 static const char* const builtins[] = {
     "help","dir","ls","type","copy","del","ren","cls","clear",
-    "echo","mem","ver","ticks","halt", 0
+    "echo","mem","ver","ticks","halt",
+    "fatmount","fatls","fatcat",
+    "readlba",
+    0
 };
 
 /* ===== История команд ===== */
 static char history[HIST_MAX][SHELL_BUFSZ];
-static int  hist_cnt = 0;
-static int  hist_head = 0;
-static int  hist_view = -1;
+static int  hist_cnt  = 0;    // записей в истории
+static int  hist_head = 0;    // куда писать следующую (кольцевой буфер)
+static int  hist_view = -1;   // текущий просмотр (-1 — отключён)
 
 static void hist_push(const char* s){
     if (!s || !*s) return;
     if (hist_cnt > 0) {
         int last = (hist_head + HIST_MAX - 1) % HIST_MAX;
-        if (strcmp(history[last], s) == 0) return;
+        if (kstrcmp(history[last], s) == 0) return;   // не дублируем подряд
     }
-    k_strlcpy(history[hist_head], s, SHELL_BUFSZ);            // <-- было strncpy
+    k_strlcpy(history[hist_head], s, SHELL_BUFSZ);
     hist_head = (hist_head + 1) % HIST_MAX;
     if (hist_cnt < HIST_MAX) hist_cnt++;
 }
@@ -77,6 +80,7 @@ static void redraw_from(const char* buf, int len, int from, uint16_t startpos, i
 /* ====== помощники строки ====== */
 static int is_space(int c){ return c==' ' || c=='\t'; }
 
+/* начало текущего токена (после последнего пробела) */
 static int token_start(const char* buf, int len, int cur){
     (void)len;
     int i = cur;
@@ -84,17 +88,19 @@ static int token_start(const char* buf, int len, int cur){
     return i;
 }
 
+/* приглашение */
 static void prompt(uint16_t* p_startpos){
     vga_puts("> ");
     *p_startpos = vga_getpos();
 }
 
+/* собрать кандидаты: команды (+ опционально имена файлов из VFS) */
 static int collect_matches(const char* pref, char out[][NAME_MAX], int max, int want_cmds, int want_files){
     int n = 0;
     if (want_cmds) {
         for (int i=0; builtins[i]; ++i){
-            if (strncmp(builtins[i], pref, strlen(pref))==0 && n<max){
-                k_strlcpy(out[n], builtins[i], NAME_MAX);     // <-- было strncpy
+            if (kstrncmp(builtins[i], pref, kstrlen(pref))==0 && n<max){
+                k_strlcpy(out[n], builtins[i], NAME_MAX);
                 n++;
             }
         }
@@ -107,13 +113,14 @@ static int collect_matches(const char* pref, char out[][NAME_MAX], int max, int 
     return n;
 }
 
+/* вставить строку s в buf на позиции cur (сдвигая хвост) */
 static void insert_str(char* buf, int* p_len, int* p_cur, int bufsz, const char* s){
     int cur=*p_cur, len=*p_len;
-    int add = (int)strlen(s);
+    int add = (int)kstrlen(s);
     if (len + add >= bufsz) add = bufsz-1-len;
     if (add<=0) return;
     for (int i=len-1;i>=cur;--i) buf[i+add]=buf[i];
-    memcpy(buf+cur, s, add);
+    kmemcpy(buf+cur, s, (size_t)add);
     len += add; cur += add;
     buf[len]=0;
     *p_len=len; *p_cur=cur;
@@ -142,36 +149,41 @@ static void shell(void) {
             hist_push(buf);
             hist_view = -1;
 
+            /* --- команды --- */
             if (buf[0] == 0) {
-                /* пусто */
+                /* пустая строка */
             }
-            else if (strcmp(buf,"help")==0) {
-                vga_puts("help, dir, type <f>, copy <a> <b>, del <f>, ren <a> <b>, cls, echo <t>, mem, ver, ticks, halt\n");
+            else if (kstrcmp(buf,"help")==0) {
+                vga_puts("help, dir/ls, type <f>, copy <a> <b>, del <f>, ren <a> <b>, cls/clear,\n");
+                vga_puts("echo <t>, mem, ver, ticks, halt,\n");
+                vga_puts("fatmount [d], fatls, fatcat <8.3>, readlba <LBA> <sec>\n");
             }
-            else if (strcmp(buf,"dir")==0 || strcmp(buf,"ls")==0) {
+            else if (kstrcmp(buf,"dir")==0 || kstrcmp(buf,"ls")==0) {
                 vfs_ls();
             }
-            else if (strncmp(buf,"type ",5)==0) {
+            else if (kstrncmp(buf,"type ",5)==0) {
                 const char* p=buf+5; while(*p==' ') p++;
                 const char* s=vfs_read(p);
                 vga_puts(s? s : "file not found\n");
             }
-            else if (strncmp(buf,"copy ",5)==0) {
+            else if (kstrncmp(buf,"copy ",5)==0) {
                 char a[64]={0}, b[64]={0};
                 const char* p=buf+5; while(*p==' ') p++;
-                int i=0; while(*p && *p!=' ' && i<63){ a[i++]=*p++; }
+                int i=0;
+                while(*p && *p!=' ' && i<63){ a[i++]=*p++; }
                 while(*p==' ') p++;
-                i=0; while(*p && i<63){ b[i++]=*p++; }
+                i=0;
+                while(*p && i<63){ b[i++]=*p++; }
                 const char* s=vfs_read(a);
                 if(!s) vga_puts("source not found\n");
-                else if(vfs_write(b,s,strlen(s),0)==0) vga_puts("copied\n");
+                else if(vfs_write(b,s,kstrlen(s),0)==0) vga_puts("copied\n");
                 else vga_puts("copy failed\n");
             }
-            else if (strncmp(buf,"del ",4)==0) {
+            else if (kstrncmp(buf,"del ",4)==0) {
                 const char* p=buf+4; while(*p==' ') p++;
                 vga_puts(vfs_delete(p)==0 ? "deleted\n" : "no such file\n");
             }
-            else if (strncmp(buf,"ren ",4)==0) {
+            else if (kstrncmp(buf,"ren ",4)==0) {
                 char a[64]={0}, b[64]={0};
                 const char* p=buf+4; while(*p==' ') p++;
                 int i=0; while(*p && *p!=' ' && i<63){ a[i++]=*p++; }
@@ -179,32 +191,65 @@ static void shell(void) {
                 i=0; while(*p && i<63){ b[i++]=*p++; }
                 vga_puts(vfs_rename(a,b)==0 ? "renamed\n" : "rename failed\n");
             }
-            else if (strcmp(buf,"cls")==0 || strcmp(buf,"clear")==0) {
+            else if (kstrcmp(buf,"cls")==0 || kstrcmp(buf,"clear")==0) {
                 vga_clear();
             }
-            else if (strncmp(buf,"echo ",5)==0) {
+            else if (kstrncmp(buf,"echo ",5)==0) {
                 const char* p=buf+5; while(*p==' ') p++; vga_puts(p); vga_puts("\n");
             }
-            else if (strcmp(buf,"mem")==0) {
+            else if (kstrcmp(buf,"mem")==0) {
                 size_t tot,used; int files; vfs_stat(&tot,&used,&files);
                 vga_puts("RAMFS total: "); vga_putdec((uint32_t)tot);
                 vga_puts(" used: ");       vga_putdec((uint32_t)used);
                 vga_puts(" files: ");      vga_putdec((uint32_t)files);
                 vga_puts("\n");
             }
-            else if (strcmp(buf,"ver")==0) {
-                vga_puts("nano-os DOS-like shell 0.4\n");
+            else if (kstrcmp(buf,"ver")==0) {
+                vga_puts("nano-os DOS-like shell 0.5 + FAT32\n");
             }
-            else if (strcmp(buf,"ticks")==0) {
+            else if (kstrcmp(buf,"ticks")==0) {
                 thread_create(user_ticks,"ticks");
             }
-            else if (strcmp(buf,"halt")==0) {
+            else if (kstrcmp(buf,"halt")==0) {
                 vga_puts("halt\n"); while(1){ __asm__ __volatile__("hlt"); }
+            }
+            /* ----- FAT32 ----- */
+            else if (kstrncmp(buf,"fatmount",8)==0) {
+                uint8_t d = 0;
+                if (buf[8]) {
+                    const char* p = buf+8; while (*p==' ') ++p;
+                    if (*p) d = (uint8_t)k_atoi(p);
+                }
+                fat_mount_shell(d);
+            }
+            else if (kstrcmp(buf,"fatls")==0) {
+                if (!fat_is_mounted()) vga_puts("FAT not mounted\n");
+                else fat_vfs_ls();
+            }
+            else if (kstrncmp(buf,"fatcat ",7)==0) {
+                if (!fat_is_mounted()) vga_puts("FAT not mounted\n");
+                else {
+                    const char* p=buf+7; while(*p==' ') p++;
+                    const char* s=fat_vfs_read(p);
+                    vga_puts(s? s : "file not found\n");
+                }
+            }
+            /* отладка чтения LBA через ATA */
+            else if (kstrncmp(buf,"readlba ",8)==0) {
+                const char* p=buf+8; while(*p==' ') p++;
+                uint32_t a = (uint32_t)k_atoi(p);
+                while(*p && *p!=' ') p++;
+                if (*p) { while(*p==' ') p++; }
+                uint32_t n = (uint32_t)k_atoi(p);
+                if (n==0) n=1;
+                extern int ata_dump_lba28(uint8_t drv, uint32_t lba, uint32_t cnt);
+                ata_dump_lba28(0, a, n);
             }
             else {
                 vga_puts("?\n");
             }
 
+            /* новая строка ввода */
             prompt(&startpos);
             buf[0]=0; len=0; cur=0;
             vga_cursor_move(startpos);
@@ -215,7 +260,7 @@ static void shell(void) {
         if (k == KB_UP || k == KB_DOWN){
             if (hist_cnt == 0) continue;
 
-            if (hist_view < 0) hist_view = hist_cnt;
+            if (hist_view < 0) hist_view = hist_cnt;         // «пустая» после последней
             if (k == KB_UP)   { if (hist_view > 0) hist_view--; }
             else              { if (hist_view < hist_cnt) hist_view++; }
 
@@ -228,8 +273,8 @@ static void shell(void) {
                 buf[0]=0; len=cur=0;
             } else {
                 const char* h = hist_get(hist_view);
-                k_strlcpy(buf, h, SHELL_BUFSZ);             // <-- было strncpy
-                len = cur = (int)strlen(buf);
+                k_strlcpy(buf, h, SHELL_BUFSZ);
+                len = cur = (int)kstrlen(buf);
                 for (int i=0;i<len;i++) vga_putchar(buf[i]);
             }
             vga_cursor_move(startpos + cur);
@@ -248,7 +293,8 @@ static void shell(void) {
             char pref[NAME_MAX]={0};
             int preflen = cur - t0;
             if (preflen > NAME_MAX-1) preflen = NAME_MAX-1;
-            memcpy(pref, buf + t0, preflen); pref[preflen]=0;
+            for (int i=0;i<preflen;i++) pref[i] = buf[t0+i];
+            pref[preflen]=0;
 
             char cand[MATCH_MAX][NAME_MAX];
             int n = collect_matches(pref, cand, MATCH_MAX, on_cmd, !on_cmd);
@@ -335,6 +381,7 @@ static void shell(void) {
     }
 }
 
+/* ===================== Точка входа ядра ===================== */
 void kmain(uint32_t multiboot_magic, uint32_t multiboot_info) {
     (void)multiboot_magic; (void)multiboot_info;
 
@@ -347,7 +394,13 @@ void kmain(uint32_t multiboot_magic, uint32_t multiboot_info) {
     paging_enable_identity_16mb();
     idt_init(); pic_init(); pit_init(); kb_init();
 
+    /* Инициализация VFS/ramfs (если используется) */
     vfs_init();
+
+    /* Инициализация кучи: от конца ядра до 16 МБ */
+    uintptr_t heap_lo = align4k((uint32_t)(uintptr_t)&end_of_kernel);
+    uintptr_t heap_hi = 16*1024*1024; /* 16MiB */
+    kheap_init((void*)heap_lo, (void*)heap_hi);
 
     __asm__ __volatile__("sti");
 

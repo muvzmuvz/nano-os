@@ -1,43 +1,104 @@
 // kernel/heap.c
-#include <stdint.h>
-#include <stddef.h>
-#include "util.h"
+#include "heap.h"
+#include "util.h" // k*_ ф-ции: align4k, kmemset, kmemcpy
+#include "tty.h"  // для отладочного вывода, если нужно
 
-/* Куча в замапленном диапазоне (paging: 0..16MiB)
-   Возьмём 4MiB с 0x00400000 по 0x007FFFFF. */
-#define HEAP_BASE 0x00400000u
-#define HEAP_SIZE 0x00400000u
+struct block_header {
+    size_t size;
+    struct block_header* next;
+    int free;
+};
 
-static uint8_t* brk  = (uint8_t*)HEAP_BASE;
-static uint8_t* endh = (uint8_t*)(HEAP_BASE + HEAP_SIZE);
+#define HDR_SZ ( (sizeof(struct block_header) + sizeof(void*) - 1) & ~(sizeof(void*) - 1) )
 
-static inline uint32_t align4k(uint32_t x){ return (x + 0xFFFu) & ~0xFFFu; }
+static void* heap_start = 0;
+static void* heap_end = 0;
+static struct block_header* first_block = 0;
+static struct block_header* free_list_head = 0;
 
-void* kmalloc(size_t n){
-    if (n == 0) return 0;
-    /* пусть будет 16-байтное выравнивание для простоты,
-       крупные блоки округлим до страницы, чтобы не фрагментить сильно */
-    uint32_t need = (uint32_t)n;
-    if (need >= 4096) need = align4k(need);
-    else              need = (need + 15u) & ~15u;
+void kheap_init(void* start, void* end) {
+    heap_start = start;
+    heap_end   = end;
 
-    if (brk + need > endh) return 0;
-    void* p = brk;
-    brk += need;
-    memset(p, 0, need);
-    return p;
+    heap_start = (void*)align4k((uint32_t)heap_start);
+    heap_end   = (void*)align4k((uint32_t)heap_end);
+
+    first_block        = (struct block_header*)heap_start;
+    first_block->size  = (size_t)((uint8_t*)heap_end - (uint8_t*)heap_start) - HDR_SZ;
+    first_block->next  = 0;
+    first_block->free  = 1;
+    free_list_head     = first_block;
 }
 
-void* kcalloc(size_t n, size_t sz){
+void* kmalloc(size_t size) {
+    if (size == 0) return 0;
+    size = (size + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
+
+    struct block_header* current = free_list_head;
+    struct block_header* prev = 0;
+
+    while (current) {
+        if (current->free && current->size >= size) {
+            if (current->size > size + HDR_SZ) {
+                struct block_header* new_split = (struct block_header*)((uint8_t*)current + HDR_SZ + size);
+                new_split->size = current->size - size - HDR_SZ;
+                new_split->free = 1;
+                new_split->next = current->next;
+
+                current->size = size;
+                current->next = new_split;
+            }
+
+            if (prev) prev->next = current->next;
+            else      free_list_head = current->next;
+
+            current->free = 0;
+            return (void*)((uint8_t*)current + HDR_SZ);
+        }
+        prev = current;
+        current = current->next;
+    }
+
+    vga_puts("kmalloc: Out of memory");
+    return 0;
+}
+
+void* kcalloc(size_t n, size_t sz) {
     size_t bytes = n * sz;
-    return kmalloc(bytes);
-}
-
-void* krealloc(void* old, size_t newsize){
-    if (!old) return kmalloc(newsize);
-    void* p = kmalloc(newsize);
-    // без информации о старом размере просто не копируем; для демо достаточно
+    void* p = kmalloc(bytes);
+    if (p) kmemset(p, 0, bytes);
     return p;
 }
 
-void kfree(void* p){ (void)p; /* бамп-аллокатор: free игнорируем */ }
+void* krealloc(void* old, size_t newsize) {
+    if (!old) return kmalloc(newsize);
+    if (newsize == 0) { kfree(old); return 0; }
+
+    newsize = (newsize + sizeof(void*) - 1) & ~(sizeof(void*) - 1);
+    struct block_header* old_hdr = (struct block_header*)((uint8_t*)old - HDR_SZ);
+
+    if (!old_hdr->free) {
+        size_t old_size = old_hdr->size;
+        if (newsize <= old_size) return old;
+
+        void* new_ptr = kmalloc(newsize);
+        if (new_ptr) {
+            kmemcpy(new_ptr, old, old_size);
+            kfree(old);
+            return new_ptr;
+        }
+        return 0;
+    } else {
+        vga_puts("krealloc: Attempted to realloc a free block");
+        return 0;
+    }
+}
+
+void kfree(void* p) {
+    if (!p) return;
+    struct block_header* hdr = (struct block_header*)((uint8_t*)p - HDR_SZ);
+    if (hdr->free) { vga_puts("kfree: Double free detected"); return; }
+    hdr->free = 1;
+    hdr->next = free_list_head;
+    free_list_head = hdr;
+}

@@ -1,4 +1,4 @@
-// kernel/sched.c (замени только места с базовым адресом стека)
+// kernel/sched.c
 #include <stdint.h>
 #include "tty.h"
 #include "util.h"
@@ -20,21 +20,20 @@ static int current = -1;
 extern void ctx_switch(ctx_t* old, ctx_t* new);
 
 void sched_init(){
-    memset(th,0,sizeof(th));
+    kmemset(th, 0, sizeof(th));
 }
 
 int thread_create(void (*entry)(void), const char* name){
     for(int i=0;i<MAX_THREADS;i++){
         if(th[i].st==UNUSED){
-            // РАНЬШЕ: 0x01000000 (16МиБ) → могло ловить #PF при identity-мэппинге 0..4МиБ.
-            // ТЕПЕРЬ: кладём в 2..3МиБ (замаплено), по 16К на поток.
             th[i].kstack = (uint8_t*)0x00200000 + i*0x4000;
             uint32_t *sp = (uint32_t*)(th[i].kstack + 0x4000);
-            *(--sp) = (uint32_t)entry;  // eip при первом входе
+            *(--sp) = (uint32_t)entry;
             th[i].ctx.eip = (uint32_t)entry;
             th[i].ctx.esp = (uint32_t)sp;
             th[i].st = READY;
-            memset(th[i].name,0,16); for(int j=0;j<15&&name[j];j++) th[i].name[j]=name[j];
+            kmemset(th[i].name, 0, 16);
+            for(int j=0;j<15&&name[j];j++) th[i].name[j]=name[j];
             return i;
         }
     }
@@ -45,14 +44,14 @@ void sched_tick(){
     int start = current;
     for(int i=1;i<=MAX_THREADS;i++){
         int n = (start+i)%MAX_THREADS;
-        if(th[n].st==READY){ int prev=current; int next=n;
+        if(th[n].st==READY){
+            int prev=current, next=n;
             if(prev==next){ th[next].st=RUNNING; return; }
             th[next].st=RUNNING;
-            int p=prev;
             current=next;
-            if(p>=0){
-                th[p].st=READY;
-                ctx_switch(&th[p].ctx, &th[next].ctx);
+            if(prev>=0){
+                th[prev].st=READY;
+                ctx_switch(&th[prev].ctx, &th[next].ctx);
             } else {
                 ctx_switch(&(ctx_t){0}, &th[next].ctx);
             }

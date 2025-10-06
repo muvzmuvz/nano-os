@@ -4,7 +4,6 @@
 #include "util.h"
 #include "tty.h"
 
-/* Простая плоская FS: до 64 файлов, имена до 31 симв., буфер под данные аллоцируется. */
 #define RAMFS_MAX_FILES 64
 
 typedef struct {
@@ -16,21 +15,20 @@ typedef struct {
 } node_t;
 
 static node_t fs[RAMFS_MAX_FILES];
-static size_t total_cap = 256*1024; /* для статистики: «воображаемый диск» 256КБ */
-extern void* kmalloc(size_t);       /* из kernel/heap.c */
+static size_t total_cap = 256*1024;
+extern void* kmalloc(size_t);
 
 static node_t* find(const char* path){
     if(!path || !*path) return 0;
-    /* допускаем "name" и "/name" */
     const char* p = (*path=='/')? path+1 : path;
     for(int i=0;i<RAMFS_MAX_FILES;i++)
-        if(fs[i].used && strcmp(fs[i].name,p)==0) return &fs[i];
+        if(fs[i].used && kstrcmp(fs[i].name,p)==0) return &fs[i];
     return 0;
 }
 static node_t* create(const char* path){
     const char* p = (*path=='/')? path+1 : path;
     for(int i=0;i<RAMFS_MAX_FILES;i++) if(!fs[i].used){
-        memset(fs[i].name,0,32);
+        kmemset(fs[i].name,0,32);
         for(int j=0;j<31 && p[j]; j++) fs[i].name[j]=p[j];
         fs[i].data=0; fs[i].len=0; fs[i].cap=0; fs[i].used=1;
         return &fs[i];
@@ -39,8 +37,7 @@ static node_t* create(const char* path){
 }
 
 void ramfs_init(void){
-    memset(fs,0,sizeof(fs));
-    /* два стартовых файла */
+    kmemset(fs,0,sizeof(fs));
     const char* h =
         "hello from ramfs!\n"
         "you can 'type hello.txt'\n";
@@ -48,8 +45,8 @@ void ramfs_init(void){
         "nano-os demo files\n"
         "hello.txt\n"
         "info.txt\n";
-    ramfs_write("hello.txt", h, strlen(h), 0);
-    ramfs_write("info.txt",  i, strlen(i), 0);
+    ramfs_write("hello.txt", h, kstrlen(h), 0);
+    ramfs_write("info.txt",  i, kstrlen(i), 0);
 }
 
 const char* ramfs_read(const char* path){
@@ -63,17 +60,17 @@ int ramfs_write(const char* path, const char* s, size_t len, int append){
 
     size_t need = append? (n->len + len) : len;
     if(need > n->cap){
-        size_t newcap = (need + 255) & ~255u; /* кратно 256 */
+        size_t newcap = (need + 255) & ~255u;
         char* nd = (char*)kmalloc(newcap);
         if(!nd) return -2;
-        if(append && n->data && n->len) memcpy(nd, n->data, n->len);
+        if(append && n->data && n->len) kmemcpy(nd, n->data, n->len);
         n->data = nd; n->cap = newcap;
     }
     if(append){
-        memcpy(n->data + n->len, s, len);
+        kmemcpy(n->data + n->len, s, len);
         n->len += len;
     } else {
-        memcpy(n->data, s, len);
+        kmemcpy(n->data, s, len);
         n->len = len;
     }
     return 0;
@@ -90,7 +87,7 @@ int ramfs_rename(const char* oldp, const char* newp){
     node_t* n = find(oldp);
     if(!n) return -1;
     const char* p = (*newp=='/')? newp+1 : newp;
-    memset(n->name,0,32);
+    kmemset(n->name,0,32);
     for(int j=0;j<31 && p[j]; j++) n->name[j]=p[j];
     return 0;
 }
